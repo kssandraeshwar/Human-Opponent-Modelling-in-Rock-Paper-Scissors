@@ -1,0 +1,216 @@
+import cv2
+import mediapipe as mp
+import time
+import random
+import tkinter as tk
+from tkinter import simpledialog
+import pickle
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import threading
+import os
+
+# ---------------------- TKINTER INPUT ----------------------
+root = tk.Tk()
+root.withdraw()
+target_score = simpledialog.askinteger("Target Score", "Enter the target score to win:", minvalue=1)
+if target_score is None:
+    exit()
+
+level = simpledialog.askinteger(
+    "AI Level",
+    "Enter AI level (1-5):\n1 = Random\n2 = Easy Q-learning\n3 = Medium Q\n4 = Trained Q\n5 = Adaptive Markov",
+    minvalue=1, maxvalue=5
+)
+if level is None:
+    exit()
+
+# ---------------------- Constants ----------------------
+choices = ['Rock', 'Paper', 'Scissors']
+tip_ids = [4, 8, 12, 16, 20]
+q_table_file = 'q_table.pkl'
+history_len = 3 if level >= 5 else 1
+alpha = 0.5
+gamma = 0.9
+epsilon_levels = {1: 1.0, 2: 0.6, 3: 0.3, 4: 0.1, 5: 0.05}
+epsilon = epsilon_levels[level]
+
+# ---------------------- Load/Save Q-table ----------------------
+if os.path.exists(q_table_file):
+    with open(q_table_file, 'rb') as f:
+        Q_table = pickle.load(f)
+else:
+    Q_table = {}
+
+def save_q_table():
+    with open(q_table_file, 'wb') as f:
+        pickle.dump(Q_table, f)
+
+# ---------------------- Real-Time Graph Setup ----------------------
+accuracy_data, win_rate_data, rounds = [], [], []
+def update_plot(frame):
+    if len(rounds) < 1:
+        return
+    plt.cla()
+    plt.title("AI Performance Over Time")
+    plt.xlabel("Round")
+    plt.ylabel("Percentage")
+    plt.plot(rounds, accuracy_data, label="Accuracy", color='green')
+    plt.plot(rounds, win_rate_data, label="Win Rate", color='blue')
+    plt.ylim(0, 100)
+    plt.legend(loc='upper left')
+
+def graph_thread():
+    ani = FuncAnimation(plt.gcf(), update_plot, interval=1000)
+    plt.tight_layout()
+    plt.show()
+
+if level > 1:
+    threading.Thread(target=graph_thread, daemon=True).start()
+
+# ---------------------- MediaPipe Setup ----------------------
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=1)
+mp_drawing = mp.solutions.drawing_utils
+cap = cv2.VideoCapture(0)
+
+# ---------------------- Game Variables ----------------------
+user_score = 0
+ai_score = 0
+tie_score = 0
+round_num = 0
+correct_predictions = 0
+total_predictions = 0
+user_history = []
+ai_history = []
+
+waiting = False
+cooldown = 2
+start_cooldown = None
+
+def classify_gesture(landmarks):
+    fingers = []
+    fingers.append(1 if landmarks[tip_ids[0]].x < landmarks[tip_ids[0] - 1].x else 0)
+    for i in range(1, 5):
+        fingers.append(1 if landmarks[tip_ids[i]].y < landmarks[tip_ids[i] - 2].y else 0)
+    total = sum(fingers)
+    if total == 0:
+        return 'Rock'
+    elif total == 2:
+        return 'Scissors'
+    elif total >= 4:
+        return 'Paper'
+    return 'Unknown'
+
+def get_winner(user, ai):
+    if user == ai: return 'Tie'
+    if (user == 'Rock' and ai == 'Scissors') or \
+       (user == 'Paper' and ai == 'Rock') or \
+       (user == 'Scissors' and ai == 'Paper'):
+        return 'User'
+    return 'AI'
+
+def get_state(history):
+    return tuple(history[-history_len:]) if len(history) >= history_len else tuple(random.choices(choices, k=history_len))
+
+def get_ai_action(state):
+    if level == 1 or random.random() < epsilon:
+        return random.choice(choices)
+    if state not in Q_table:
+        Q_table[state] = [0, 0, 0]
+    return choices[Q_table[state].index(max(Q_table[state]))]
+
+def update_q_table(state, action, reward, next_state):
+    if state not in Q_table:
+        Q_table[state] = [0, 0, 0]
+    if next_state not in Q_table:
+        Q_table[next_state] = [0, 0, 0]
+    idx = choices.index(action)
+    max_future = max(Q_table[next_state])
+    Q_table[state][idx] += alpha * (reward + gamma * max_future - Q_table[state][idx])
+
+# ---------------------- Main Game Loop ----------------------
+while True:
+    success, frame = cap.read()
+    if not success:
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = hands.process(rgb)
+
+    if not waiting and result.multi_hand_landmarks:
+        for hand_landmarks in result.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            user_choice = classify_gesture(hand_landmarks.landmark)
+
+            state = get_state(user_history)
+            ai_choice = get_ai_action(state)
+
+            if user_choice in choices:
+                user_history.append(user_choice)
+                ai_history.append(ai_choice)
+
+                winner = get_winner(user_choice, ai_choice)
+                next_state = get_state(user_history + [user_choice])
+
+                if level >= 2:
+                    reward = 1 if winner == 'AI' else (-1 if winner == 'User' else 0)
+                    # Reward bonus for streak
+                    if ai_score >= 2 and winner == 'AI':
+                        reward += 0.5
+                    update_q_table(state, ai_choice, reward, next_state)
+
+                if ai_choice == user_choice:
+                    correct_predictions += 1
+                if winner == 'AI':
+                    ai_score += 1
+                elif winner == 'User':
+                    user_score += 1
+                else:
+                    tie_score += 1
+
+                total_predictions += 1
+                round_num += 1
+
+                # Update graph
+                acc = (correct_predictions / total_predictions) * 100
+                win = (ai_score / total_predictions) * 100
+                accuracy_data.append(acc)
+                win_rate_data.append(win)
+                rounds.append(round_num)
+
+                waiting = True
+                start_cooldown = time.time()
+
+    elif waiting:
+        time_left = cooldown - int(time.time() - start_cooldown)
+        if time_left <= 0:
+            waiting = False
+        else:
+            cv2.putText(frame, f"Next round in: {time_left}s", (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 100, 255), 2)
+
+    # ---------------------- Display Info ----------------------
+    cv2.putText(frame, f"Score — You: {user_score} | AI: {ai_score} | Ties: {tie_score}", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+    if total_predictions > 0:
+        acc = (correct_predictions / total_predictions) * 100
+        win = (ai_score / total_predictions) * 100
+        cv2.putText(frame, f"Accuracy: {acc:.1f}% | AI Win Rate: {win:.1f}%", (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    if user_score >= target_score:
+        cv2.putText(frame, "🎉 You Won!", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
+    elif ai_score >= target_score:
+        cv2.putText(frame, "😈 AI Won!", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 100, 255), 3)
+
+    cv2.imshow("RL Rock Paper Scissors", frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+save_q_table()
+cap.release()
+cv2.destroyAllWindows()
+
